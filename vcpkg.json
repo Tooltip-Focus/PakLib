@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "paklib",
+  "version-string": "0.1.0",
+  "builtin-baseline": "dc1232a6e05dcc49703091e83743e3b4df9b9b7c",
+  "dependencies": [
+    "cli11",
+    "xxhash",
+    "zstd"
+  ],
+  "features": {
+    "tests": {
+      "description": "Build the GoogleTest test suite",
+      "dependencies": [
+        "gtest"
+      ]
+    },
+    "benchmarks": {
+      "description": "Build the Google Benchmark suite",
+      "dependencies": [
+        "benchmark",
+        "libzip"
+      ]
+    }
+  }
+}

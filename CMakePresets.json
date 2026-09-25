@@ -1,0 +1,118 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "PAKLIB_BUILD_TOOLS": "ON"
+      }
+    },
+    {
+      "name": "windows-debug",
+      "inherits": "windows-base"
+    },
+    {
+      "name": "windows-release",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "PAKLIB_ENABLE_IPO": "ON"
+      }
+    },
+    {
+      "name": "windows-tests",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "PAKLIB_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
+      "name": "windows-benchmarks",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "PAKLIB_BUILD_BENCHMARKS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "benchmarks"
+      }
+    },
+    {
+      "name": "windows-validation",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "PAKLIB_BUILD_TESTS": "ON",
+        "PAKLIB_BUILD_BENCHMARKS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests;benchmarks"
+      }
+    },
+    {
+      "name": "windows-static",
+      "displayName": "Static libraries for Rust/FFI consumers",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+        "PAKLIB_ENABLE_IPO": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "windows-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "windows-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "tests",
+      "configurePreset": "windows-tests",
+      "configuration": "Debug"
+    },
+    {
+      "name": "benchmarks",
+      "configurePreset": "windows-benchmarks",
+      "configuration": "Release"
+    },
+    {
+      "name": "validation",
+      "configurePreset": "windows-validation",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-static",
+      "configurePreset": "windows-static",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "tests",
+      "configurePreset": "windows-tests",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "validation",
+      "configurePreset": "windows-validation",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

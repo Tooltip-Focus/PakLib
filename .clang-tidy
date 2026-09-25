@@ -1,0 +1,44 @@
+# Conservative checks intended to expose correctness and performance issues
+# without replacing the project's compiler warnings or formatting rules.
+# modernize-use-using is intentionally omitted because CAbi.h is valid C.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-branch-clone,
+  -bugprone-macro-parentheses,
+  -bugprone-invalid-enum-default-initialization,
+  performance-*,
+  -performance-avoid-endl,
+  -performance-enum-size,
+  concurrency-*,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-equals-default,
+  modernize-use-emplace,
+  modernize-loop-convert,
+  modernize-redundant-void-arg,
+  readability-container-size-empty,
+  readability-misleading-indentation,
+  readability-non-const-parameter,
+  readability-redundant-control-flow,
+  readability-redundant-member-init,
+  readability-redundant-smartptr-get,
+  readability-redundant-string-cstr,
+  readability-simplify-boolean-expr,
+  readability-static-definition-in-anonymous-namespace,
+  misc-unused-using-decls,
+  misc-redundant-expression
+
+# Limit diagnostics to PakLib sources; generated and third-party headers remain
+# outside this filter even when they appear in the compilation database.
+HeaderFilterRegex: '.*[/\\](include|src|tests|benchmarks|tools)[/\\].*'
+
+WarningsAsErrors: ''
+FormatStyle: file
+
+CheckOptions:
+  # The benchmark main has a catch-all boundary, which this check does not
+  # recognize through MSVC's std::filesystem conversion helpers.
+  bugprone-exception-escape.CheckMain: false
