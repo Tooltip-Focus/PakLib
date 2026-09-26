@@ -87,7 +87,9 @@ DDS, OGG, PNG, JPEG, and KTX2 raw.
 
 ## Reader API
 
-Raw entries are most efficient through `File::Map`:
+`Archive::Open` maps the whole archive read-only once. Every read is served
+from that mapping; there is no per-file `CreateFile`, `ReadFile`, or extra
+mapping. `File`, `Cursor`, and `MappedView` keep the archive alive.
 
 ```cpp
 #include <pak/Reader.h>
@@ -105,26 +107,101 @@ if (!found)
     return found.GetError();
 }
 auto file = std::move(found.Value());
+```
 
+There are two ways to get the bytes:
+
+| | `File::Map` | `File::ReadAt` |
+|---|---|---|
+| Copy | None: a view into the archive mapping | Into a caller-owned buffer |
+| Entries | Raw (`Compression::none`) only, else `not_mappable` | Raw and compressed |
+| Lifetime | Valid while the `MappedView` lives | Buffer is yours |
+
+### `Map`: zero copy, raw entries only
+
+```cpp
 auto mapped = file.Map(0, static_cast<std::size_t>(file.Size()));
 if (!mapped)
 {
-    return mapped.GetError();
+    return mapped.GetError();   // not_mappable if the entry is compressed
 }
-UploadOrConsume(mapped.Value().Bytes());
+std::span<const std::byte> bytes = mapped.Value().Bytes();
+UploadOrConsume(bytes);   // read directly from the archive pages
 ```
 
-`Archive` owns one read-only Windows mapping for the complete archive.
-`File`, `Cursor`, and `MappedView` keep the archive state alive. Destroying
-a mapped subview does not perform another `UnmapViewOfFile`.
+Pages are faulted in on first access. Destroying a `MappedView` does not call
+`UnmapViewOfFile`; the archive owns the single mapping.
 
-Use `ReadAt` for compressed data, streaming, small ranges, or caller-owned
-buffers. Reads are positional and thread-safe. Each thread reuses one
-decompression context and the last partially decoded block.
+### `ReadAt`: copy into your buffer, any entry
 
-`Archive::OpenMemory` performs no copy. Its input must remain valid and
-unchanged until the archive and every object obtained from it have been
-destroyed.
+```cpp
+std::vector<std::byte> buffer(static_cast<std::size_t>(file.Size()));
+auto read = file.ReadAt(0, buffer);
+if (!read)
+{
+    return read.GetError();
+}
+// Do your stuff with buffer (read.Value() bytes were written)
+```
+
+For a raw entry, `ReadAt` is a `memcpy` from the mapping. For a compressed
+entry, it decompresses the blocks covering the range: whole blocks are decoded
+straight into the destination, partial blocks go through a per-thread cache
+that keeps the last decoded block, so small sequential reads do not decode the
+same block twice. `ReadAt` is positional and thread-safe.
+
+`ReadAt` writes into whatever memory you give it. If the data is going
+somewhere anyway, such as a GPU upload buffer, read straight into it rather
+than into a temporary `std::vector` first: that saves one copy.
+
+### `Cursor`: read in chunks
+
+When the whole entry should not be in memory at once, a `Cursor` reads it
+piece by piece and remembers where it stopped:
+
+```cpp
+auto cursor = file.CreateCursor();
+std::array<std::byte, 64 * 1024> chunk;
+while (cursor.Remaining() > 0)
+{
+    auto read = cursor.Read(chunk);
+    if (!read)
+    {
+        return read.GetError();
+    }
+    // Do your stuff with the first read.Value() bytes of chunk
+}
+```
+
+`Seek` and `Tell` move and query the position. Each thread should use its own
+`Cursor`; several cursors can read the same file at the same time.
+
+### Choosing
+
+```cpp
+if (file.GetCompression() == pak::Compression::none)
+{
+    auto mapped = file.Map(0, static_cast<std::size_t>(file.Size()));
+    UploadOrConsume(mapped.Value().Bytes());
+}
+else
+{
+    std::vector<std::byte> buffer(static_cast<std::size_t>(file.Size()));
+    auto read = file.ReadAt(0, buffer);
+    // Do your stuff with buffer
+}
+```
+
+| Entry | What you do with the data | Use |
+|---|---|---|
+| Raw | Consume it in place (upload, parse, hash...) | `Map`: no copy at all |
+| Raw | Keep or modify your own copy | `ReadAt` into your buffer |
+| Compressed | Anything | `ReadAt`: the only option, `Map` returns `not_mappable` |
+| Any | Too large to hold at once | `Cursor`, chunk by chunk |
+
+`Archive::OpenMemory` works the same way over caller-owned bytes and performs
+no copy. Its input must remain valid and unchanged until the archive and every
+object obtained from it have been destroyed.
 
 ## Writer API
 
