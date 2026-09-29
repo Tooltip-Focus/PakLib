@@ -13,6 +13,8 @@
 #include <cstddef>
 #include <limits>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace pak::tests
@@ -152,5 +154,85 @@ namespace pak::tests
 		auto archive = Archive::Open(archive_path);
 		ASSERT_TRUE(archive);
 		EXPECT_EQ(archive.Value().FileCount(), 1u);
+	}
+
+	TEST(Writer, ParallelFilesMatchSequentialArchive)
+	{
+		TemporaryDirectory temporary;
+		// Compressible, varied content: every Zstd level yields different bytes,
+		// so the comparison also proves the configured level reaches each block.
+		std::vector<std::byte> text(std::size_t {700} * 1024);
+		auto                   value = 0x9E3779B9u;
+		for(std::size_t index = 0; index < text.size(); ++index)
+		{
+			value       = value * 1664525u + 1013904223u;
+			text[index] = static_cast<std::byte>('a' + (value >> 28u) + (index / 4096u) % 7u);
+		}
+
+		const std::array<std::pair<const char *, std::vector<std::byte>>, 5> contents {{
+		    {"Text.txt", text},
+		    {"Random.bin", MakeData(300000, 11)},
+		    {"Empty.bin", {}},
+		    {"Stored.txt", text},
+		    {"Forced.txt", std::vector<std::byte>(text.begin(), text.begin() + 200000)},
+		}};
+		const std::array<CompressionPolicy, 5> policies {CompressionPolicy::automatic, CompressionPolicy::automatic, CompressionPolicy::automatic, CompressionPolicy::none, CompressionPolicy::zstd};
+		std::vector<SourceFile> files;
+		for(std::size_t index = 0; index < contents.size(); ++index)
+		{
+			const auto source = temporary.Path() / contents[index].first;
+			WriteBytes(source, contents[index].second);
+			files.push_back(SourceFile {source, std::string {"Data\\"} + contents[index].first, FileOptions {policies[index]}});
+		}
+		const WriterOptions options {64u * 1024u, 9, 0.02f, 16, true};
+
+		const auto serial_path   = temporary.Path() / "Serial.pak";
+		auto       serial_result = ArchiveWriter::Create(serial_path, options);
+		ASSERT_TRUE(serial_result);
+		auto serial = std::move(serial_result.Value());
+		for(const auto &file : files)
+		{
+			ASSERT_TRUE(serial.AddFile(file.source, file.archive_path, file.options));
+		}
+		ASSERT_TRUE(serial.Finalize());
+		const auto expected = ReadBytes(serial_path);
+
+		auto archive_result = Archive::Open(serial_path);
+		ASSERT_TRUE(archive_result);
+		auto text_file = archive_result.Value().Find("Data/Text.txt");
+		ASSERT_TRUE(text_file);
+		EXPECT_EQ(text_file.Value().GetCompression(), Compression::zstd_blocks);
+		EXPECT_LT(text_file.Value().StoredSize(), text_file.Value().Size());
+
+		for(const std::uint32_t workers : {0u, 1u, 3u})
+		{
+			const auto parallel_path   = temporary.Path() / ("Parallel" + std::to_string(workers) + ".pak");
+			auto       parallel_result = ArchiveWriter::Create(parallel_path, options);
+			ASSERT_TRUE(parallel_result);
+			auto parallel = std::move(parallel_result.Value());
+			ASSERT_TRUE(parallel.AddFilesParallel(files, workers));
+			ASSERT_TRUE(parallel.Finalize());
+			EXPECT_TRUE(ReadBytes(parallel_path) == expected) << workers << " worker(s)";
+		}
+	}
+
+	TEST(Writer, ParallelRejectsDuplicateAndMissingFiles)
+	{
+		TemporaryDirectory temporary;
+		const auto         source = temporary.Path() / "Data.bin";
+		WriteBytes(source, MakeData(1024));
+
+		auto writer_result = ArchiveWriter::Create(temporary.Path() / "Duplicate.pak");
+		ASSERT_TRUE(writer_result);
+		auto                          writer = std::move(writer_result.Value());
+		const std::vector<SourceFile> duplicates {{source, "Folder\\Data.bin"}, {source, "Folder/Data.bin"}};
+		auto                          duplicate = writer.AddFilesParallel(duplicates);
+		ASSERT_FALSE(duplicate);
+		EXPECT_EQ(duplicate.GetError().code, ErrorCode::already_exists);
+
+		const std::vector<SourceFile> missing {{source, "Data.bin"}, {temporary.Path() / "Missing.bin", "Missing.bin"}};
+		EXPECT_FALSE(writer.AddFilesParallel(missing));
+		// Earlier files may already be written: a failed batch poisons the writer.
+		EXPECT_FALSE(writer.Finalize());
 	}
 }   // namespace pak::tests

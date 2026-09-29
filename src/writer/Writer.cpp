@@ -12,6 +12,7 @@
 #include "writer/WriterState.h"
 
 #include <zstd.h>
+#include <omp.h>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -129,6 +131,157 @@ namespace pak
 			}
 		}
 
+		struct ZstdContextDeleter final
+		{
+			void operator()(ZSTD_CCtx *context) const noexcept
+			{
+				ZSTD_freeCCtx(context);
+			}
+		};
+
+		using ZstdContext = std::unique_ptr<ZSTD_CCtx, ZstdContextDeleter>;
+
+		[[nodiscard]] std::size_t ChunkCapacity(const WriterOptions &options, CompressionPolicy policy) noexcept
+		{
+			return policy == CompressionPolicy::none ? 1024u * 1024u : options.block_size;
+		}
+
+		[[nodiscard]] float SavingThreshold(const WriterOptions &options, CompressionPolicy policy) noexcept
+		{
+			return policy == CompressionPolicy::automatic ? options.minimum_saving : 0.0f;
+		}
+
+		// Compresses one block into `output`, sized with ZSTD_compressBound. Returns
+		// the compressed size, or zero when the block saves less than `threshold`
+		// and must be stored raw. The same context always yields the same bytes as
+		// a fresh one, so reusing it keeps archives deterministic.
+		[[nodiscard]] Result<std::size_t> CompressBlock(ZSTD_CCtx *context, std::span<const std::byte> input, std::span<std::byte> output, int level, float threshold) noexcept
+		{
+			if(context == nullptr)
+			{
+				return Error {ErrorCode::io_error};
+			}
+			const auto compressed_size = ZSTD_compressCCtx(context, output.data(), output.size(), input.data(), input.size(), level);
+			if(ZSTD_isError(compressed_size))
+			{
+				return Error {ErrorCode::io_error};
+			}
+			const auto required_size = static_cast<std::size_t>(static_cast<double>(input.size()) * (1.0 - threshold));
+			return compressed_size < input.size() && compressed_size <= required_size ? compressed_size : std::size_t {0};
+		}
+
+		// Reads `size` bytes in chunks of at most `capacity`, hashes them and hands
+		// each chunk with its offset to `consume`. Returns the content hash.
+		template<typename ReadSource, typename Consume>
+		[[nodiscard]] Result<std::uint64_t> ReadChunks(std::uint64_t size, std::size_t capacity, ReadSource &&read_source, Consume &&consume) noexcept
+		{
+			const auto hash = detail::CreateHashState();
+			if(!hash)
+			{
+				return Error {ErrorCode::io_error};
+			}
+			std::vector<std::byte> input(static_cast<std::size_t>(std::min<std::uint64_t>(capacity, size)));
+			for(std::uint64_t offset = 0; offset < size;)
+			{
+				const auto chunk = std::span<std::byte> {input}.first(static_cast<std::size_t>(std::min<std::uint64_t>(input.size(), size - offset)));
+				if(auto read = read_source(offset, chunk); !read)
+				{
+					return read.GetError();
+				}
+				if(XXH3_64bits_update(hash.get(), chunk.data(), chunk.size()) == XXH_ERROR)
+				{
+					return Error {ErrorCode::io_error};
+				}
+				if(auto consumed = consume(offset, std::span<const std::byte> {chunk}); !consumed)
+				{
+					return consumed.GetError();
+				}
+				offset += chunk.size();
+			}
+			return XXH3_64bits_digest(hash.get());
+		}
+
+		// Appends one entry at the end of the archive. `write_blocks` receives an
+		// `append_block(stored, uncompressed_offset, uncompressed_size, compressed)`
+		// callback, writes every block in order and returns the content hash. The
+		// path, data and block records are rolled back unless the entry completes.
+		template<typename WriteBlocks>
+		[[nodiscard]] Result<void> AppendEntry(detail::WriterState &state, std::string path, std::uint64_t size, CompressionPolicy policy, WriteBlocks &&write_blocks) noexcept
+		{
+			auto [path_iterator, inserted] = state.paths.emplace(std::move(path));
+			if(!inserted)
+			{
+				return Error {ErrorCode::already_exists};
+			}
+			detail::Defer rollback_path {[&state, path_iterator]() noexcept { state.paths.erase(path_iterator); }};
+
+			const auto    rollback_offset = state.current_offset;
+			const auto    rollback_blocks = state.blocks.size();
+			detail::Defer rollback {[&state, rollback_offset, rollback_blocks]() noexcept { Rollback(state, rollback_offset, rollback_blocks); }};
+
+			if(auto alignment = AlignOutput(state); !alignment)
+			{
+				return alignment;
+			}
+
+			detail::BuildEntry build_entry;
+			build_entry.path        = *path_iterator;
+			auto &entry             = build_entry.record;
+			entry.path_hash         = XXH3_64bits(build_entry.path.data(), build_entry.path.size());
+			entry.data_offset       = state.current_offset;
+			entry.uncompressed_size = size;
+			if(state.options.checksum_entries)
+			{
+				entry.flags |= detail::entry_has_checksum;
+			}
+
+			bool any_compressed = false;
+			auto append_block   = [&](std::span<const std::byte> stored, std::uint64_t uncompressed_offset, std::size_t uncompressed_size, bool compressed) noexcept -> Result<void>
+			{
+				if(policy != CompressionPolicy::none)
+				{
+					detail::BlockRecord block;
+					block.data_offset         = state.current_offset;
+					block.stored_size         = static_cast<std::uint32_t>(stored.size());
+					block.uncompressed_size   = static_cast<std::uint32_t>(uncompressed_size);
+					block.uncompressed_offset = uncompressed_offset;
+					state.blocks.push_back(block);
+				}
+				if(auto write = WriteAll(state.file.Get(), stored); !write)
+				{
+					return write;
+				}
+				state.current_offset += stored.size();
+				entry.stored_size += stored.size();
+				any_compressed |= compressed;
+				return {};
+			};
+			auto content_hash = write_blocks(append_block);
+			if(!content_hash)
+			{
+				return content_hash.GetError();
+			}
+			entry.content_hash = content_hash.Value();
+
+			// An entry whose blocks all stayed raw is stored as one contiguous file.
+			if(any_compressed)
+			{
+				entry.compression       = Compression::zstd_blocks;
+				entry.block_size        = state.options.block_size;
+				entry.block_table_index = rollback_blocks;
+				entry.block_count       = static_cast<std::uint32_t>(state.blocks.size() - rollback_blocks);
+			}
+			else
+			{
+				state.blocks.resize(rollback_blocks);
+			}
+
+			state.entries.push_back(build_entry);
+			rollback_path.Release();
+			rollback.Release();
+			return {};
+		}
+
 		template<typename ReadSource>
 		[[nodiscard]] Result<void> AddContent(detail::WriterState &state, std::string_view archive_path, std::uint64_t size, FileOptions file_options, ReadSource &&read_source) noexcept
 		{
@@ -141,128 +294,149 @@ namespace pak
 			{
 				return writable;
 			}
-			auto [path_iterator, inserted] = state.paths.emplace(std::move(normalized.Value()));
-			if(!inserted)
-			{
-				return Error {ErrorCode::already_exists};
-			}
-			detail::Defer rollback_path {[&state, path_iterator]() noexcept { state.paths.erase(path_iterator); }};
 
-			const auto    rollback_offset = state.current_offset;
-			const auto    rollback_blocks = state.blocks.size();
-			detail::Defer rollback {[&state, rollback_offset, rollback_blocks]() noexcept { Rollback(state, rollback_offset, rollback_blocks); }};
-
-			auto alignment = AlignOutput(state);
-			if(!alignment)
-			{
-				return alignment.GetError();
-			}
-
-			detail::BuildEntry build_entry;
-			build_entry.path        = *path_iterator;
-			auto &entry             = build_entry.record;
-			entry.path_hash         = XXH3_64bits(build_entry.path.data(), build_entry.path.size());
-			entry.data_offset       = state.current_offset;
-			entry.uncompressed_size = size;
-			entry.block_size        = state.options.block_size;
-			entry.block_table_index = state.blocks.size();
-			if(state.options.checksum_entries)
-			{
-				entry.flags |= detail::entry_has_checksum;
-			}
-
-			const auto hash = detail::CreateHashState();
-			if(!hash)
-			{
-				return Error {ErrorCode::io_error};
-			}
-
-			const auto             chunk_capacity = file_options.compression == CompressionPolicy::none ? 1024u * 1024u : state.options.block_size;
-			std::vector<std::byte> input(chunk_capacity);
+			const auto             policy = file_options.compression;
+			ZstdContext            context;
 			std::vector<std::byte> compressed;
-			if(file_options.compression != CompressionPolicy::none)
+			if(policy != CompressionPolicy::none)
 			{
-				compressed.resize(ZSTD_compressBound(state.options.block_size));
+				context.reset(ZSTD_createCCtx());
+				compressed.resize(ZSTD_compressBound(static_cast<std::size_t>(std::min<std::uint64_t>(state.options.block_size, size))));
 			}
+			const auto level     = state.options.zstd_level;
+			const auto threshold = SavingThreshold(state.options, policy);
 
-			std::uint64_t source_offset  = 0;
-			bool          any_compressed = false;
-			while(source_offset < size)
+			return AppendEntry(state, std::move(normalized.Value()), size, policy,
+			                   [&](auto &append_block) noexcept
+			                   {
+				                   return ReadChunks(size, ChunkCapacity(state.options, policy), read_source,
+				                                     [&](std::uint64_t offset, std::span<const std::byte> chunk) noexcept -> Result<void>
+				                                     {
+					                                     if(policy == CompressionPolicy::none)
+					                                     {
+						                                     return append_block(chunk, offset, chunk.size(), false);
+					                                     }
+					                                     auto compressed_size = CompressBlock(context.get(), chunk, compressed, level, threshold);
+					                                     if(!compressed_size)
+					                                     {
+						                                     return compressed_size.GetError();
+					                                     }
+					                                     if(compressed_size.Value() == 0)
+					                                     {
+						                                     return append_block(chunk, offset, chunk.size(), false);
+					                                     }
+					                                     return append_block(std::span<const std::byte> {compressed}.first(compressed_size.Value()), offset, chunk.size(), true);
+				                                     });
+			                   });
+		}
+
+		struct PreparedBlock final
+		{
+			std::vector<std::byte> bytes;
+			std::uint64_t          uncompressed_offset = 0;
+			std::size_t            uncompressed_size   = 0;
+			bool                   compressed          = false;
+		};
+
+		struct PreparedEntry final
+		{
+			std::uint64_t              size         = 0;
+			std::uint64_t              content_hash = 0;
+			std::vector<PreparedBlock> blocks;
+		};
+
+		[[nodiscard]] Error CompressPreparedBlock(PreparedBlock &block, ZSTD_CCtx *context, int level, float threshold) noexcept
+		{
+			std::vector<std::byte> compressed(ZSTD_compressBound(block.bytes.size()));
+			auto                   compressed_size = CompressBlock(context, block.bytes, compressed, level, threshold);
+			if(!compressed_size)
 			{
-				const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(input.size(), size - source_offset));
-				auto       read  = read_source(source_offset, std::span<std::byte> {input}.first(count));
-				if(!read)
-				{
-					return read.GetError();
-				}
-				if(XXH3_64bits_update(hash.get(), input.data(), count) == XXH_ERROR)
-				{
-					return Error {ErrorCode::io_error};
-				}
-
-				if(file_options.compression == CompressionPolicy::none)
-				{
-					auto write = WriteAll(state.file.Get(), std::span<const std::byte> {input}.first(count));
-					if(!write)
-					{
-						return write.GetError();
-					}
-					state.current_offset += count;
-					entry.stored_size += count;
-				}
-				else
-				{
-					const auto compressed_size = ZSTD_compress(compressed.data(), compressed.size(), input.data(), count, state.options.zstd_level);
-					if(ZSTD_isError(compressed_size))
-					{
-						return Error {ErrorCode::io_error};
-					}
-
-					const auto threshold      = file_options.compression == CompressionPolicy::automatic ? state.options.minimum_saving : 0.0f;
-					const auto required_size  = static_cast<std::size_t>(static_cast<double>(count) * (1.0 - threshold));
-					const bool use_compressed = compressed_size < count && compressed_size <= required_size;
-					const auto stored_size    = use_compressed ? compressed_size : count;
-					const auto stored_bytes   = use_compressed ? std::span<const std::byte> {compressed}.first(compressed_size) : std::span<const std::byte> {input}.first(count);
-
-					detail::BlockRecord block;
-					block.data_offset         = state.current_offset;
-					block.stored_size         = static_cast<std::uint32_t>(stored_size);
-					block.uncompressed_size   = static_cast<std::uint32_t>(count);
-					block.uncompressed_offset = source_offset;
-					state.blocks.push_back(block);
-
-					auto write = WriteAll(state.file.Get(), stored_bytes);
-					if(!write)
-					{
-						return write.GetError();
-					}
-					any_compressed |= use_compressed;
-					state.current_offset += stored_size;
-					entry.stored_size += stored_size;
-				}
-				source_offset += count;
+				return compressed_size.GetError();
 			}
-
-			entry.content_hash = XXH3_64bits_digest(hash.get());
-			if(file_options.compression != CompressionPolicy::none && any_compressed)
+			if(compressed_size.Value() != 0)
 			{
-				entry.compression = Compression::zstd_blocks;
-				entry.block_count = static_cast<std::uint32_t>(state.blocks.size() - rollback_blocks);
+				compressed.resize(compressed_size.Value());
+				block.bytes      = std::move(compressed);
+				block.compressed = true;
 			}
-			else
-			{
-				entry.compression       = Compression::none;
-				entry.block_count       = 0;
-				entry.block_table_index = 0;
-				entry.block_size        = 0;
-				state.blocks.resize(rollback_blocks);
-				entry.stored_size = entry.uncompressed_size;
-			}
-
-			state.entries.push_back(build_entry);
-			rollback_path.Release();
-			rollback.Release();
 			return {};
+		}
+
+		// Reads one file into memory, then compresses its blocks as tasks shared by
+		// the whole OpenMP team so a single large file does not serialize on the
+		// worker that read it. Each task uses the context of the thread running it.
+		[[nodiscard]] Result<PreparedEntry> PrepareFile(const SourceFile &source, const WriterOptions &options, ZSTD_CCtx *const *contexts) noexcept
+		{
+			auto source_file = detail::OpenReadFile(source.source, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
+			if(!source_file)
+			{
+				return source_file.GetError();
+			}
+			auto source_size = detail::FileSize(source_file.Value().Get());
+			if(!source_size)
+			{
+				return source_size.GetError();
+			}
+
+			const auto    policy = source.options.compression;
+			PreparedEntry prepared;
+			prepared.size     = source_size.Value();
+			auto content_hash = ReadChunks(
+			    prepared.size, ChunkCapacity(options, policy),
+			    [handle = source_file.Value().Get()](std::uint64_t, std::span<std::byte> destination) noexcept { return ReadAll(handle, destination); },
+			    [&prepared](std::uint64_t offset, std::span<const std::byte> chunk) noexcept -> Result<void>
+			    {
+				    prepared.blocks.push_back(PreparedBlock {std::vector<std::byte>(chunk.begin(), chunk.end()), offset, chunk.size()});
+				    return {};
+			    });
+			if(!content_hash)
+			{
+				return content_hash.GetError();
+			}
+			prepared.content_hash = content_hash.Value();
+			if(policy == CompressionPolicy::none)
+			{
+				return prepared;
+			}
+
+			// Tasks only capture plain values and pointers: MSVC's /openmp:llvm hands
+			// tasks garbage for reference parameters, which once turned the configured
+			// Zstd level into 144 (clamped to 22) for every block.
+			const int      level     = options.zstd_level;
+			const float    threshold = SavingThreshold(options, policy);
+			PreparedBlock *blocks    = prepared.blocks.data();
+			std::vector<Error> errors(prepared.blocks.size());
+			Error             *block_errors = errors.data();
+			for(std::size_t index = 0; index < prepared.blocks.size(); ++index)
+			{
+				#pragma omp task default(none) firstprivate(index, blocks, block_errors, contexts, level, threshold)
+				block_errors[index] = CompressPreparedBlock(blocks[index], contexts[omp_get_thread_num()], level, threshold);
+			}
+			#pragma omp taskwait
+			for(const auto &error : errors)
+			{
+				if(error)
+				{
+					return error;
+				}
+			}
+			return prepared;
+		}
+
+		[[nodiscard]] Result<void> AppendPrepared(detail::WriterState &state, const SourceFile &source, const PreparedEntry &prepared) noexcept
+		{
+			return AppendEntry(state, source.archive_path, prepared.size, source.options.compression,
+			                   [&prepared](auto &append_block) noexcept -> Result<std::uint64_t>
+			                   {
+				                   for(const auto &block : prepared.blocks)
+				                   {
+					                   if(auto appended = append_block(block.bytes, block.uncompressed_offset, block.uncompressed_size, block.compressed); !appended)
+					                   {
+						                   return appended.GetError();
+					                   }
+				                   }
+				                   return prepared.content_hash;
+			                   });
 		}
 
 		void SerializeHeader(std::vector<std::byte> &output, const detail::ArchiveHeader &header)
@@ -466,6 +640,119 @@ namespace pak
 		}
 		auto read_source = [handle = source_file.Value().Get()](std::uint64_t, std::span<std::byte> destination) noexcept { return ReadAll(handle, destination); };
 		return AddContent(*m_state, archive_path, source_size.Value(), options, read_source);
+	}
+
+	Result<void> ArchiveWriter::AddFilesParallel(std::span<const SourceFile> files, std::uint32_t worker_count) noexcept
+	{
+		if(!m_state)
+		{
+			return Error {ErrorCode::invalid_argument};
+		}
+		if(auto writable = CheckWritable(*m_state); !writable)
+		{
+			return writable;
+		}
+		if(files.empty())
+		{
+			return {};
+		}
+
+		// Validate the whole batch before writing anything, so a rejected batch
+		// leaves the writer untouched.
+		std::vector<SourceFile> normalized_files;
+		normalized_files.reserve(files.size());
+		std::unordered_set<std::string> batch_paths;
+		batch_paths.reserve(files.size());
+		for(const auto &file : files)
+		{
+			if(file.source.empty())
+			{
+				return Error {ErrorCode::invalid_argument};
+			}
+			auto normalized = detail::NormalizePath(file.archive_path);
+			if(!normalized)
+			{
+				return normalized.GetError();
+			}
+			if(m_state->paths.contains(normalized.Value()) || !batch_paths.emplace(normalized.Value()).second)
+			{
+				return Error {ErrorCode::already_exists};
+			}
+			normalized_files.push_back(SourceFile {file.source, std::move(normalized.Value()), file.options});
+		}
+
+		// Blocks of one file are shared across the team, so even a small batch
+		// can use every requested worker.
+		const auto available = static_cast<std::uint32_t>(std::max(1, omp_get_num_procs()));
+		const auto workers   = static_cast<int>(worker_count == 0 ? available : std::min(worker_count, available));
+		// Files are compressed in waves and appended in input order after each
+		// wave, which bounds the memory held by prepared files. Eight files per
+		// worker give dynamic scheduling room to absorb uneven file sizes.
+		const auto                                wave_capacity = std::min(normalized_files.size(), static_cast<std::size_t>(workers) * 8u);
+		std::vector<std::optional<PreparedEntry>> prepared(wave_capacity);
+		std::vector<Error>                        errors(wave_capacity);
+		std::vector<ZstdContext>                  contexts(static_cast<std::size_t>(workers));
+		std::vector<ZSTD_CCtx *>                  context_pointers(static_cast<std::size_t>(workers), nullptr);
+		Error                                     first_error;
+
+		// The team must have exactly `workers` threads: one context per thread.
+		const int     previous_dynamic = omp_get_dynamic();
+		detail::Defer restore_dynamic {[previous_dynamic]() noexcept { omp_set_dynamic(previous_dynamic); }};
+		omp_set_dynamic(0);
+		#pragma omp parallel num_threads(workers)
+		{
+			const auto thread_index = static_cast<std::size_t>(omp_get_thread_num());
+			contexts[thread_index].reset(ZSTD_createCCtx());
+			context_pointers[thread_index] = contexts[thread_index].get();
+			#pragma omp barrier
+			for(std::size_t wave_begin = 0; wave_begin < normalized_files.size(); wave_begin += wave_capacity)
+			{
+				const auto wave_size = std::min(wave_capacity, normalized_files.size() - wave_begin);
+				#pragma omp for schedule(dynamic, 1)
+				for(std::int64_t slot = 0; slot < static_cast<std::int64_t>(wave_size); ++slot)
+				{
+					auto result = PrepareFile(normalized_files[wave_begin + static_cast<std::size_t>(slot)], m_state->options, context_pointers.data());
+					if(result)
+					{
+						prepared[static_cast<std::size_t>(slot)].emplace(std::move(result.Value()));
+					}
+					else
+					{
+						errors[static_cast<std::size_t>(slot)] = result.GetError();
+					}
+				}
+
+				#pragma omp single
+				{
+					for(std::size_t slot = 0; slot < wave_size && !first_error; ++slot)
+					{
+						if(errors[slot])
+						{
+							first_error = errors[slot];
+						}
+						else if(auto appended = AppendPrepared(*m_state, normalized_files[wave_begin + slot], *prepared[slot]); !appended)
+						{
+							first_error = appended.GetError();
+						}
+					}
+					std::fill(prepared.begin(), prepared.end(), std::nullopt);
+					std::fill(errors.begin(), errors.end(), Error {});
+				}
+				// The implicit barrier of `single` publishes first_error to the team.
+				if(first_error)
+				{
+					break;
+				}
+			}
+		}
+
+		if(first_error)
+		{
+			// Earlier waves are already in the archive: the batch cannot be undone.
+			m_state->failed = true;
+			return first_error;
+		}
+		return {};
 	}
 
 	Result<void> ArchiveWriter::AddBytes(std::string_view archive_path, std::span<const std::byte> bytes, FileOptions options) noexcept

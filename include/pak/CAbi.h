@@ -33,6 +33,15 @@ extern "C"
 		uint8_t  reserved[3];
 	} pak_writer_options;
 
+	typedef struct pak_source_file
+	{
+		const wchar_t *source_path;
+		const char *archive_path_utf8;
+		size_t archive_path_size;
+		uint8_t compression_policy;
+		uint8_t reserved[7];
+	} pak_source_file;
+
 	enum pak_compression_policy
 	{
 		PAK_COMPRESSION_NONE      = 0,
@@ -68,6 +77,9 @@ extern "C"
 	uint16_t pak_writer_create(const wchar_t *output_path, const pak_writer_options *options, pak_writer_handle **out_writer, pak_error *out_error);
 
 	uint16_t pak_writer_add_file(pak_writer_handle *writer, const wchar_t *source_path, const char *archive_path_utf8, size_t archive_path_size, uint8_t compression_policy, pak_error *out_error);
+
+	/** worker_count == 0 uses every processor available to OpenMP. */
+	uint16_t pak_writer_add_files_parallel(pak_writer_handle *writer, const pak_source_file *files, size_t file_count, uint32_t worker_count, pak_error *out_error);
 
 	uint16_t pak_writer_finalize(pak_writer_handle *writer, pak_error *out_error);
 

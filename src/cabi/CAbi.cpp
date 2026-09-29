@@ -11,8 +11,10 @@
 #include <filesystem>
 #include <new>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 struct pak_archive_handle
 {
@@ -31,6 +33,7 @@ struct pak_writer_handle
 
 static_assert(sizeof(pak_error) == 16);
 static_assert(sizeof(pak_writer_options) == 20);
+static_assert(sizeof(pak_source_file) == 32);
 
 namespace
 {
@@ -80,6 +83,16 @@ namespace
 		}
 		*out_handle = handle;
 		return Succeed(output);
+	}
+
+	[[nodiscard]] bool IsValidSource(const wchar_t *source_path, const char *archive_path_utf8, uint8_t compression_policy) noexcept
+	{
+		return source_path != nullptr && archive_path_utf8 != nullptr && compression_policy <= PAK_COMPRESSION_AUTOMATIC;
+	}
+
+	[[nodiscard]] pak::FileOptions ToFileOptions(uint8_t compression_policy) noexcept
+	{
+		return pak::FileOptions {static_cast<pak::CompressionPolicy>(compression_policy)};
 	}
 }   // namespace
 
@@ -171,12 +184,35 @@ extern "C" uint16_t pak_writer_create(const wchar_t *output_path, const pak_writ
 
 extern "C" uint16_t pak_writer_add_file(pak_writer_handle *writer, const wchar_t *source_path, const char *archive_path_utf8, size_t archive_path_size, uint8_t compression_policy, pak_error *out_error)
 {
-	if(writer == nullptr || source_path == nullptr || archive_path_utf8 == nullptr || compression_policy > PAK_COMPRESSION_AUTOMATIC)
+	if(writer == nullptr || !IsValidSource(source_path, archive_path_utf8, compression_policy))
 	{
 		return Invalid(out_error);
 	}
-	return Complete(writer->value.AddFile(std::filesystem::path {source_path}, std::string_view {archive_path_utf8, archive_path_size}, pak::FileOptions {static_cast<pak::CompressionPolicy>(compression_policy)}),
+	return Complete(writer->value.AddFile(std::filesystem::path {source_path}, std::string_view {archive_path_utf8, archive_path_size}, ToFileOptions(compression_policy)),
 	                out_error);
+}
+
+extern "C" uint16_t pak_writer_add_files_parallel(pak_writer_handle *writer, const pak_source_file *files, size_t file_count, uint32_t worker_count, pak_error *out_error)
+{
+	if(writer == nullptr || (files == nullptr && file_count != 0))
+	{
+		return Invalid(out_error);
+	}
+	std::vector<pak::SourceFile> sources;
+	sources.reserve(file_count);
+	for(size_t index = 0; index < file_count; ++index)
+	{
+		const auto &file = files[index];
+		if(!IsValidSource(file.source_path, file.archive_path_utf8, file.compression_policy))
+		{
+			return Invalid(out_error);
+		}
+		sources.push_back(pak::SourceFile {
+			std::filesystem::path {file.source_path},
+			std::string {file.archive_path_utf8, file.archive_path_size},
+			ToFileOptions(file.compression_policy)});
+	}
+	return Complete(writer->value.AddFilesParallel(sources, worker_count), out_error);
 }
 
 extern "C" uint16_t pak_writer_finalize(pak_writer_handle *writer, pak_error *out_error)
