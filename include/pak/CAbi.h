@@ -78,7 +78,7 @@ extern "C"
 
 	uint16_t pak_writer_add_file(pak_writer_handle *writer, const wchar_t *source_path, const char *archive_path_utf8, size_t archive_path_size, uint8_t compression_policy, pak_error *out_error);
 
-	/** worker_count == 0 uses every processor available to OpenMP. */
+	/** worker_count == 0 uses every logical processor. */
 	uint16_t pak_writer_add_files_parallel(pak_writer_handle *writer, const pak_source_file *files, size_t file_count, uint32_t worker_count, pak_error *out_error);
 
 	uint16_t pak_writer_finalize(pak_writer_handle *writer, pak_error *out_error);

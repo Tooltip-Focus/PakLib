@@ -22,9 +22,6 @@ endif()
 
 find_package(zstd CONFIG REQUIRED)
 find_package(xxHash CONFIG REQUIRED)
-if(NOT MSVC)
-    find_package(OpenMP REQUIRED COMPONENTS CXX)
-endif()
 
 if(TARGET zstd::libzstd_static)
     set(PAKLIB_ZSTD_TARGET zstd::libzstd_static)
@@ -66,17 +63,6 @@ pak_add_library(pak_reader reader ${PAKLIB_READER_SOURCES})
 pak_add_library(pak_writer writer ${PAKLIB_WRITER_SOURCES})
 target_link_libraries(pak_writer PUBLIC pak_reader)
 pak_add_library(pak_c_api c_api ${PAKLIB_READER_SOURCES} ${PAKLIB_WRITER_SOURCES} src/cabi/CAbi.cpp)
-
-# The writer compresses in parallel. On MSVC, only LLVM's OpenMP runtime
-# supports the tasks that spread the blocks of one large file across the team;
-# /openmp:llvm also links that runtime.
-foreach(target pak_writer pak_c_api)
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /openmp:llvm)
-    else()
-        target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
-    endif()
-endforeach()
 
 if(PAKLIB_BUILD_TOOLS)
     find_package(CLI11 CONFIG REQUIRED)

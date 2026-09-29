@@ -12,16 +12,17 @@
 #include "writer/WriterState.h"
 
 #include <zstd.h>
-#include <omp.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -362,10 +363,33 @@ namespace pak
 			return {};
 		}
 
-		// Reads one file into memory, then compresses its blocks as tasks shared by
-		// the whole OpenMP team so a single large file does not serialize on the
-		// worker that read it. Each task uses the context of the thread running it.
-		[[nodiscard]] Result<PreparedEntry> PrepareFile(const SourceFile &source, const WriterOptions &options, ZSTD_CCtx *const *contexts) noexcept
+		// Runs `body(index, worker)` for every index below `count` on up to
+		// `workers` threads, the calling one included, and returns once every
+		// index is done. Indices are handed out one at a time, so uneven items
+		// balance across threads; `worker` is unique among concurrent calls.
+		template<typename Body>
+		void ParallelFor(std::size_t count, std::size_t workers, Body &&body) noexcept
+		{
+			std::atomic<std::size_t> next {0};
+			auto                     run = [&](std::size_t worker) noexcept
+			{
+				for(auto index = next.fetch_add(1, std::memory_order_relaxed); index < count; index = next.fetch_add(1, std::memory_order_relaxed))
+				{
+					body(index, worker);
+				}
+			};
+			std::vector<std::jthread> threads;
+			const auto                thread_count = std::min(workers, count);
+			for(std::size_t worker = 1; worker < thread_count; ++worker)
+			{
+				threads.emplace_back(run, worker);
+			}
+			run(0);
+		}
+
+		// Reads and hashes one file into memory, split into the blocks it will be
+		// stored as. Compression happens afterwards, block by block.
+		[[nodiscard]] Result<PreparedEntry> PrepareFile(const SourceFile &source, const WriterOptions &options) noexcept
 		{
 			auto source_file = detail::OpenReadFile(source.source, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
 			if(!source_file)
@@ -394,32 +418,6 @@ namespace pak
 				return content_hash.GetError();
 			}
 			prepared.content_hash = content_hash.Value();
-			if(policy == CompressionPolicy::none)
-			{
-				return prepared;
-			}
-
-			// Tasks only capture plain values and pointers: MSVC's /openmp:llvm hands
-			// tasks garbage for reference parameters, which once turned the configured
-			// Zstd level into 144 (clamped to 22) for every block.
-			const int      level     = options.zstd_level;
-			const float    threshold = SavingThreshold(options, policy);
-			PreparedBlock *blocks    = prepared.blocks.data();
-			std::vector<Error> errors(prepared.blocks.size());
-			Error             *block_errors = errors.data();
-			for(std::size_t index = 0; index < prepared.blocks.size(); ++index)
-			{
-				#pragma omp task default(none) firstprivate(index, blocks, block_errors, contexts, level, threshold)
-				block_errors[index] = CompressPreparedBlock(blocks[index], contexts[omp_get_thread_num()], level, threshold);
-			}
-			#pragma omp taskwait
-			for(const auto &error : errors)
-			{
-				if(error)
-				{
-					return error;
-				}
-			}
 			return prepared;
 		}
 
@@ -681,69 +679,87 @@ namespace pak
 			normalized_files.push_back(SourceFile {file.source, std::move(normalized.Value()), file.options});
 		}
 
-		// Blocks of one file are shared across the team, so even a small batch
-		// can use every requested worker.
-		const auto available = static_cast<std::uint32_t>(std::max(1, omp_get_num_procs()));
-		const auto workers   = static_cast<int>(worker_count == 0 ? available : std::min(worker_count, available));
-		// Files are compressed in waves and appended in input order after each
-		// wave, which bounds the memory held by prepared files. Eight files per
-		// worker give dynamic scheduling room to absorb uneven file sizes.
-		const auto                                wave_capacity = std::min(normalized_files.size(), static_cast<std::size_t>(workers) * 8u);
+		const auto available = std::max(1u, std::thread::hardware_concurrency());
+		const auto workers   = static_cast<std::size_t>(worker_count == 0 ? available : std::min(worker_count, available));
+		const auto &options  = m_state->options;
+		std::vector<ZstdContext> contexts(workers);
+		for(auto &context : contexts)
+		{
+			context.reset(ZSTD_createCCtx());
+		}
+
+		// Files go in waves: read, compress every block of the wave (blocks of
+		// one large file spread across all workers), then append in input order.
+		// Waves bound the memory held by prepared files; eight files per worker
+		// leave room to balance uneven file sizes.
+		struct BlockJob final
+		{
+			PreparedBlock *block;
+			std::size_t    slot;
+			float          threshold;
+			Error          error;
+		};
+		const auto                                wave_capacity = std::min(normalized_files.size(), workers * 8u);
 		std::vector<std::optional<PreparedEntry>> prepared(wave_capacity);
 		std::vector<Error>                        errors(wave_capacity);
-		std::vector<ZstdContext>                  contexts(static_cast<std::size_t>(workers));
-		std::vector<ZSTD_CCtx *>                  context_pointers(static_cast<std::size_t>(workers), nullptr);
+		std::vector<BlockJob>                     jobs;
 		Error                                     first_error;
-
-		// The team must have exactly `workers` threads: one context per thread.
-		const int     previous_dynamic = omp_get_dynamic();
-		detail::Defer restore_dynamic {[previous_dynamic]() noexcept { omp_set_dynamic(previous_dynamic); }};
-		omp_set_dynamic(0);
-		#pragma omp parallel num_threads(workers)
+		for(std::size_t wave_begin = 0; wave_begin < normalized_files.size() && !first_error; wave_begin += wave_capacity)
 		{
-			const auto thread_index = static_cast<std::size_t>(omp_get_thread_num());
-			contexts[thread_index].reset(ZSTD_createCCtx());
-			context_pointers[thread_index] = contexts[thread_index].get();
-			#pragma omp barrier
-			for(std::size_t wave_begin = 0; wave_begin < normalized_files.size(); wave_begin += wave_capacity)
-			{
-				const auto wave_size = std::min(wave_capacity, normalized_files.size() - wave_begin);
-				#pragma omp for schedule(dynamic, 1)
-				for(std::int64_t slot = 0; slot < static_cast<std::int64_t>(wave_size); ++slot)
-				{
-					auto result = PrepareFile(normalized_files[wave_begin + static_cast<std::size_t>(slot)], m_state->options, context_pointers.data());
-					if(result)
-					{
-						prepared[static_cast<std::size_t>(slot)].emplace(std::move(result.Value()));
-					}
-					else
-					{
-						errors[static_cast<std::size_t>(slot)] = result.GetError();
-					}
-				}
+			const auto wave_size = std::min(wave_capacity, normalized_files.size() - wave_begin);
+			ParallelFor(wave_size, workers,
+			            [&](std::size_t slot, std::size_t) noexcept
+			            {
+				            auto result = PrepareFile(normalized_files[wave_begin + slot], options);
+				            if(result)
+				            {
+					            prepared[slot].emplace(std::move(result.Value()));
+				            }
+				            else
+				            {
+					            errors[slot] = result.GetError();
+				            }
+			            });
 
-				#pragma omp single
+			jobs.clear();
+			for(std::size_t slot = 0; slot < wave_size; ++slot)
+			{
+				const auto policy = normalized_files[wave_begin + slot].options.compression;
+				if(prepared[slot] && policy != CompressionPolicy::none)
 				{
-					for(std::size_t slot = 0; slot < wave_size && !first_error; ++slot)
+					for(auto &block : prepared[slot]->blocks)
 					{
-						if(errors[slot])
-						{
-							first_error = errors[slot];
-						}
-						else if(auto appended = AppendPrepared(*m_state, normalized_files[wave_begin + slot], *prepared[slot]); !appended)
-						{
-							first_error = appended.GetError();
-						}
+						jobs.push_back(BlockJob {&block, slot, SavingThreshold(options, policy), {}});
 					}
-					std::fill(prepared.begin(), prepared.end(), std::nullopt);
-					std::fill(errors.begin(), errors.end(), Error {});
-				}
-				// The implicit barrier of `single` publishes first_error to the team.
-				if(first_error)
-				{
-					break;
 				}
 			}
+			ParallelFor(jobs.size(), workers,
+			            [&](std::size_t index, std::size_t worker) noexcept
+			            {
+				            auto &job = jobs[index];
+				            job.error = CompressPreparedBlock(*job.block, contexts[worker].get(), options.zstd_level, job.threshold);
+			            });
+			for(const auto &job : jobs)
+			{
+				if(job.error && !errors[job.slot])
+				{
+					errors[job.slot] = job.error;
+				}
+			}
+
+			for(std::size_t slot = 0; slot < wave_size && !first_error; ++slot)
+			{
+				if(errors[slot])
+				{
+					first_error = errors[slot];
+				}
+				else if(auto appended = AppendPrepared(*m_state, normalized_files[wave_begin + slot], *prepared[slot]); !appended)
+				{
+					first_error = appended.GetError();
+				}
+			}
+			std::fill(prepared.begin(), prepared.end(), std::nullopt);
+			std::fill(errors.begin(), errors.end(), Error {});
 		}
 
 		if(first_error)
